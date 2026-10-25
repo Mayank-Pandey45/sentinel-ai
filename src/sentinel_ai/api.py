@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .agent import OpenAICompatiblePlanner
 from .auth import Session, SessionCodec, hash_password, verify_password
+from .browser import SUPPORTED_BROWSER_CHANNELS
 from .models import AuthorizationRecord, ScanLimits
 from .report import render_html_report
 from .scope import ScopeGuardian, ScopeViolation
@@ -327,9 +328,13 @@ def create_app(
         probe = head_probe(normalized, authorization)
         if not probe.reachable or probe.state != "reachable":
             raise HTTPException(422, {"message": "Target did not pass authorization and reachability validation.", "probe": probe.__dict__})
+        browser_channel = os.environ.get("SENTINEL_BROWSER_CHANNEL", "chromium").strip().lower()
+        if browser_channel not in SUPPORTED_BROWSER_CHANNELS:
+            raise HTTPException(503, "SENTINEL_BROWSER_CHANNEL must name a supported Playwright Chromium channel.")
         config = {
             "target_url": normalized, "selected_checks": payload.selected_checks, "headless": payload.headless,
             "capture_screenshots": payload.capture_screenshots, "ai_analysis": payload.ai_analysis,
+            "browser_channel": browser_channel,
             "limits": payload.limits.model_dump(mode="json"), "report_formats": ["html", "json", "pdf"],
         }
         scan = store.create_scan({"organization_id": session.organization_id, "target_id": target["id"], "config": config, "created_by": session.user_id})

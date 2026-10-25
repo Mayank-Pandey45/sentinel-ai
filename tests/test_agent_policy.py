@@ -48,10 +48,23 @@ class AgentPolicyTests(unittest.TestCase):
 
     def test_same_scope_links_are_allowed_but_sensitive_and_repeated_links_are_not(self):
         links = {"link-1": "https://example.com/app/profile"}
-        self.assertTrue(self.policy.decide(self.proposal(), links, set()).allowed)
+        allowed = self.policy.decide(self.proposal(), links, set())
+        self.assertTrue(allowed.allowed)
+        self.assertTrue(allowed.requires_approval)
         self.assertFalse(self.policy.decide(self.proposal(), links, {"https://example.com/app/profile"}).allowed)
         sensitive = {"link-1": "https://example.com/app/logout"}
         self.assertFalse(self.policy.decide(self.proposal(), sensitive, set()).allowed)
+
+    def test_safe_navigation_is_scope_checked_without_click_approval(self):
+        proposal = self.proposal(action="navigate")
+        decision = self.policy.decide(
+            proposal,
+            {"link-1": "https://example.com/app/profile"},
+            set(),
+        )
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.requires_approval)
+        self.assertEqual(decision.destination, "https://example.com/app/profile")
 
     def test_iteration_budget_stops_repeated_planning(self):
         proposal = self.proposal(action="inspect", target_id=None)

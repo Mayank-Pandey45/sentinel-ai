@@ -10,7 +10,7 @@ Sentinel AI is a local browser security assessment workspace for sites you own o
 - One local Playwright worker. Visible Chromium is the default. Headless mode can be selected for environments where a desktop browser cannot launch.
 - Per-scan browser contexts; same-scope bounded crawl; request pacing and limits; screenshots; sanitized network events; no form submission; and pause, resume, stop, and emergency-stop controls.
 - Evidence-based passive observations for security headers, session-cookie attributes, transport, forms, and same-scope browser/API discovery.
-- Optional structured AI navigation proposals. Actions are schema validated and policy checked; credentials, cookie values, form submission, arbitrary code, and arbitrary HTTP tools are not provided to the model.
+- Optional structured AI navigation proposals using an observe → plan → policy-check → act → verify loop. Same-scope link clicks require human approval; credentials, cookie values, form submission, arbitrary code, and arbitrary HTTP tools are not provided to the model.
 - HTML, JSON, and PDF reports generated from the persisted result, including a report for zero-finding scans.
 
 Unsupported checks are visibly disabled. Active testing is not implemented and remains unavailable. Selecting a check does not guarantee detection.
@@ -49,6 +49,19 @@ Open [http://127.0.0.1:4173](http://127.0.0.1:4173). On first launch the termina
 
 To choose another local data directory, set `SENTINEL_DATA_DIR` before starting. Do not bind the dashboard to a LAN address: the app rejects non-loopback clients and the supported deployment is local-only.
 
+### Visible browser on Windows
+
+The worker defaults to Playwright's bundled Chromium. To use an installed Google Chrome Beta build on a Windows desktop, set the channel before starting the dashboard:
+
+```powershell
+$env:SENTINEL_BROWSER_CHANNEL = "chrome-beta"
+# Set this only when continuing with the existing workspace database:
+$env:SENTINEL_DATA_DIR = "artifacts\sentinel-dashboard"
+python -m sentinel_ai.server --host 127.0.0.1 --port 4173
+```
+
+Assessments default to `headless=False`; the worker opens a visible browser window and keeps Chromium sandboxing enabled. The channel is saved in each assessment configuration and appears in the activity timeline. If launch fails, the scan records the actual launch error and fails; the worker does not silently retry in headless mode. The installed system browser must be present on the worker computer. Playwright supports branded browser channels such as `chrome-beta` and `msedge` ([browser documentation](https://playwright.dev/python/docs/browsers)).
+
 ## Try a local authorized fixture
 
 In another terminal, start the included fixture if it is not already running:
@@ -62,8 +75,8 @@ The fixture listens only on `127.0.0.1:8000`. In the dashboard:
 1. Open **Authorized Targets** and add `http://127.0.0.1:8000/`.
 2. Record the local test authorization reference and expiry; check the loopback option only for this fixture.
 3. Open **New Assessment**, select that target, enter the same URL, then choose **Validate target**.
-4. Select implemented passive checks and start the assessment. Visible Chromium is the default; enable headless mode if the browser window cannot launch in your environment.
-5. Follow the persisted event timeline and screenshots in **Live Browser**, then download HTML, PDF, or JSON from **Reports**.
+4. Select implemented passive checks and start the assessment. Leave headless mode off to watch Chromium open on the worker desktop.
+5. Follow persisted observations, AI proposals, policy decisions, approvals, browser actions, verification results, and timestamped screenshots in **Live Browser**, then download HTML, PDF, or JSON from **Reports**.
 
 The sample site is only a local test fixture. Do not scan a third-party or production target unless the owner has authorized the exact host, path scope, test method, and assessment window.
 
@@ -80,6 +93,8 @@ python -m sentinel_ai.server
 ```
 
 Provider endpoints must use HTTPS; plain HTTP is accepted only for a localhost endpoint. With no valid provider settings the dashboard reports **AI unavailable** and deterministic passive scanning still works. The provider receives limited observations such as sanitized same-scope URLs and form counts; it does not receive cookie values, passwords, form values, or raw page text. A model response is only a proposal, never a finding.
+
+When enabled, the planner receives a fresh observation for each bounded step. Deterministic policy validates every proposed destination against the saved authorization scope and blocks common state-changing URL patterns. Safe inspection, scrolling, and screenshot actions can run directly; each proposed link click waits for a human approval in the dashboard. Forms and buttons are never activated, even with provider credentials configured. If the provider is not configured or returns an error, the event log records that fact and the passive crawler continues without claiming AI activity.
 
 ## Tests
 
@@ -100,5 +115,5 @@ The suite covers URL and authorization policy, SSRF-related IP rules, redirect s
 - No active exploit checks, form submission, credential use, destructive operation, port scan, or unrestricted model action is available.
 - Playwright request policy is defense in depth, not an operating-system egress firewall. DNS can change between policy checks and the browser connection. Use a disposable VM/container with host/network egress restrictions for security assessments.
 - Screenshots can contain sensitive client data. They and the SQLite database remain in the local data directory; protect that directory and remove it under your data-retention policy.
-- The present Windows host previously failed to launch headed Chromium with `BrowserType.launch: spawn UNKNOWN`; headless Chromium passed. Visible-browser behavior must be verified on the intended desktop/worker.
+- On the current Windows host, Playwright's cached Chromium failed with Windows `WinError 14001` (side-by-side configuration error), surfaced by Playwright as `BrowserType.launch: spawn UNKNOWN`. A freshly downloaded Playwright Chromium was denied by Windows integrity policy (`0xC0E90002`). Headed execution was verified using the installed Chrome Beta channel with the Chromium sandbox enabled. This selects a supported installed browser and does not disable security protections.
 - Before production use, add a reviewed identity and tenant model, hardened network egress, deployment secrets and encryption, operational monitoring, authorization evidence management, and a security review of the full application.

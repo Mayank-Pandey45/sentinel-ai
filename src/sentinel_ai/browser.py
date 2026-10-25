@@ -25,6 +25,17 @@ _SENSITIVE_ACTION = re.compile(
     r"subscribe|confirm|resetpassword|changepassword|payment|update|create|submit|cancel|approve)",
     re.IGNORECASE,
 )
+SUPPORTED_BROWSER_CHANNELS = {
+    "chromium",
+    "chrome",
+    "chrome-beta",
+    "chrome-dev",
+    "chrome-canary",
+    "msedge",
+    "msedge-beta",
+    "msedge-dev",
+    "msedge-canary",
+}
 _SECURITY_HEADERS = (
     "strict-transport-security",
     "content-security-policy",
@@ -49,6 +60,7 @@ class BrowserController:
         live_logs: bool = True,
         capture_screenshots: bool = True,
         selected_checks: list[str] | None = None,
+        browser_channel: str = "chromium",
         ai_planner: OpenAICompatiblePlanner | None = None,
         approval_gate: Callable[[ActionProposal], bool] | None = None,
         event_sink: Callable[[ActivityEvent], None] | None = None,
@@ -62,6 +74,11 @@ class BrowserController:
         self.live_logs = live_logs
         self.capture_screenshots = capture_screenshots
         self.selected_checks = selected_checks or ["passive_baseline", "browser_discovery"]
+        browser_channel = browser_channel.strip().lower()
+        if browser_channel not in SUPPORTED_BROWSER_CHANNELS:
+            allowed = ", ".join(sorted(SUPPORTED_BROWSER_CHANNELS))
+            raise ValueError(f"Unsupported browser channel {browser_channel!r}; choose one of: {allowed}")
+        self.browser_channel = browser_channel
         self.ai_planner = ai_planner
         self.approval_gate = approval_gate
         self.event_sink = event_sink
@@ -129,13 +146,40 @@ class BrowserController:
                 ) from exc
 
             with sync_playwright() as playwright:
-                self._browser = playwright.chromium.launch(headless=self.headless)
+                self._record(
+                    "browser_launch_started",
+                    self.target_url,
+                    {
+                        "channel": self.browser_channel,
+                        "headless": self.headless,
+                        "chromium_sandbox": True,
+                    },
+                )
+                launch_options: dict[str, Any] = {
+                    "headless": self.headless,
+                    "chromium_sandbox": True,
+                }
+                if self.browser_channel != "chromium":
+                    launch_options["channel"] = self.browser_channel
+                self._browser = playwright.chromium.launch(**launch_options)
                 self._browser_metadata = {
                     "engine": "Chromium",
                     "browser_version": self._browser.version,
+                    "browser_channel": self.browser_channel,
                     "headless": self.headless,
+                    "chromium_sandbox": True,
                     "viewport": "1280x720",
                 }
+                self._record(
+                    "browser_launch_succeeded",
+                    self.target_url,
+                    {
+                        "channel": self.browser_channel,
+                        "browser_version": self._browser.version,
+                        "headless": self.headless,
+                        "chromium_sandbox": True,
+                    },
+                )
                 context = self._browser.new_context(service_workers="block", accept_downloads=False)
                 context.set_default_navigation_timeout(self.limits.navigation_timeout_ms)
                 context.set_default_timeout(self.limits.navigation_timeout_ms)
@@ -207,18 +251,31 @@ class BrowserController:
         return [finding for finding in findings if check_for(finding.id) in selected]
 
     def _crawl(self, page: Any) -> None:
-        queue: deque[tuple[str, int, bool]] = deque([(self.target_url, 0, False)])
+        queue: deque[tuple[str, int, bool, str | None]] = deque([(self.target_url, 0, False, None)])
         visited: set[str] = set()
         while queue and len(self._pages) < self.limits.max_pages and not self._stop.is_set():
             self._wait_until_resumed()
             self._check_bounds()
             if self._stop.is_set():
                 break
-            url, depth, already_loaded = queue.popleft()
+            url, depth, already_loaded, ai_proposal_id = queue.popleft()
             try:
                 self.guardian.validate_url(url)
             except ScopeViolation as exc:
                 self._record("navigation_blocked", url, {"reason": str(exc)[:240]})
+                if ai_proposal_id:
+                    self._record(
+                        "ai_action_verified",
+                        url,
+                        {
+                            "proposal_id": ai_proposal_id,
+                            "action": "navigate",
+                            "verified": False,
+                            "expected_url": sanitize_url(url),
+                            "actual_url": None,
+                            "reason": str(exc)[:240],
+                        },
+                    )
                 continue
             key = sanitize_url(url)
             if key in visited:
@@ -230,12 +287,28 @@ class BrowserController:
             if self._pages and self.limits.navigation_delay_seconds:
                 time.sleep(self.limits.navigation_delay_seconds)
             self._record("navigation_started", url, {"depth": depth, "via": "approved-link-click" if already_loaded else "navigation"})
+            if ai_proposal_id:
+                self._record(
+                    "ai_action_started",
+                    url,
+                    {"proposal_id": ai_proposal_id, "action": "navigate", "destination": sanitize_url(url)},
+                )
             try:
                 if already_loaded and sanitize_url(page.url) == key:
                     status_code = self._response_details.get(key, {}).get("status_code")
                 else:
                     response = page.goto(url, wait_until="domcontentloaded")
                     status_code = response.status if response is not None else None
+                if ai_proposal_id:
+                    self._record(
+                        "ai_action_executed",
+                        page.url or url,
+                        {
+                            "proposal_id": ai_proposal_id,
+                            "action": "navigate",
+                            "destination": sanitize_url(url),
+                        },
+                    )
                 if self._stop.is_set():
                     break
                 self._wait_until_resumed()
@@ -243,11 +316,22 @@ class BrowserController:
                 doc_url = page.url or url
                 self.guardian.validate_url(doc_url)
                 safe_doc_url = sanitize_url(doc_url)
+                if ai_proposal_id:
+                    verified = safe_doc_url == sanitize_url(url)
+                    self._record(
+                        "ai_action_verified",
+                        doc_url,
+                        {
+                            "proposal_id": ai_proposal_id,
+                            "action": "navigate",
+                            "verified": verified,
+                            "expected_url": sanitize_url(url),
+                            "actual_url": safe_doc_url,
+                        },
+                    )
                 details = self._response_details.get(safe_doc_url, {})
                 safe_links: list[dict[str, str]] = []
                 crawl_candidates: list[str] = []
-                agent_links: dict[str, str] = {}
-                anchor_indices: dict[str, int] = {}
                 for index, link in enumerate(data.get("links", [])[:500]):
                     candidate = str(link.get("url", ""))
                     try:
@@ -259,14 +343,6 @@ class BrowserController:
                         "text": str(link.get("text", ""))[:160],
                     })
                     crawl_candidates.append(candidate)
-                    target_id = f"link-{index}"
-                    if (
-                        str(link.get("target", "")).lower() in {"", "_self"}
-                        and not bool(link.get("download"))
-                        and not bool(link.get("has_onclick"))
-                    ):
-                        agent_links[target_id] = candidate
-                        anchor_indices[target_id] = index
                 page_observation = PageObservation(
                     url=safe_doc_url,
                     title=str(data.get("title", ""))[:300],
@@ -295,9 +371,6 @@ class BrowserController:
                     selected_by_agent = self._run_agent_step(
                         page,
                         page_observation,
-                        data,
-                        agent_links,
-                        anchor_indices,
                         visited,
                         queue,
                         depth,
@@ -311,124 +384,382 @@ class BrowserController:
                         except ScopeViolation:
                             continue
                         if sanitize_url(candidate) not in visited and not self._has_sensitive_action(candidate):
-                            queue.append((candidate, depth + 1, False))
+                            queue.append((candidate, depth + 1, False, None))
             except Exception as exc:
                 self._record("navigation_error", url, {"error_type": type(exc).__name__, "message": str(exc)[:300]})
+                if ai_proposal_id:
+                    actual_url = page.url or None
+                    self._record(
+                        "ai_action_verified",
+                        actual_url or url,
+                        {
+                            "proposal_id": ai_proposal_id,
+                            "action": "navigate",
+                            "verified": False,
+                            "expected_url": sanitize_url(url),
+                            "actual_url": sanitize_url(actual_url) if actual_url else None,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
 
     def _run_agent_step(
         self,
         page: Any,
         observation: PageObservation,
-        page_data: dict[str, Any],
-        allowed_links: dict[str, str],
-        anchor_indices: dict[str, int],
         visited: set[str],
-        queue: deque[tuple[str, int, bool]],
+        queue: deque[tuple[str, int, bool, str | None]],
         depth: int,
     ) -> bool:
-        """Ask for one structured action, enforce policy, then execute only supported browser operations."""
-        if self._agent_policy.iterations >= self._agent_policy.max_iterations:
-            self._record("agent_stopped", observation.url, {"reason": "agent iteration limit reached"})
-            return False
-        snapshot = {
-            "current_url": observation.url,
-                    "title_present": bool(observation.title),
-            "interactive_elements": [
-                {"target_id": key, "kind": "same-scope link", "url": sanitize_url(value)}
-                for key, value in list(allowed_links.items())[:30]
-            ],
-            "form_summary": {"count": len(observation.forms), "methods": sorted({str(form.get("method", "get")) for form in observation.forms})},
-            "recent_actions": [item.event for item in self._activity[-10:]],
-            "authorized_hosts": self.authorization.allowed_domains,
-            "allowed_url_prefixes": self.authorization.allowed_url_prefixes,
-            "request_count": self._request_count,
-            "pages_observed": len(self._pages),
-        }
-        try:
-            proposal = self.ai_planner.propose(snapshot)
-        except ProviderError as exc:
-            self._record("ai_provider_error", observation.url, {"reason": str(exc)[:180]})
-            self.ai_planner = None
-            return False
-        except Exception as exc:
-            self._record("ai_provider_error", observation.url, {"reason": f"{type(exc).__name__}: {str(exc)[:140]}"})
-            self.ai_planner = None
-            return False
+        """Run bounded observe/plan/policy/act/verify steps on the current page."""
+        repeated_actions: set[tuple[str, str | None, int | None]] = set()
+        while self._agent_policy.iterations < self._agent_policy.max_iterations and not self._stop.is_set():
+            self._wait_until_resumed()
+            self._check_bounds()
+            if self._stop.is_set():
+                return True
 
-        decision = self._agent_policy.decide(proposal, allowed_links, visited)
-        self._record("ai_proposal", observation.url, {
-            "objective": proposal.objective,
-            "action": proposal.action,
-            "target_id": proposal.target_id,
-            "reason": proposal.reason[:240],
-            "expected_result": proposal.expected_result,
-            "policy_allowed": decision.allowed,
-            "policy_reason": decision.reason,
-            "requires_approval": proposal.requires_approval,
-        })
-        if not decision.allowed:
-            self._record("ai_action_rejected", observation.url, {"reason": decision.reason})
-            return False
-        if proposal.action in {"navigate", "click"} and depth >= self.limits.max_depth:
-            self._record("ai_action_rejected", observation.url, {"reason": "navigation depth limit reached"})
-            return True
-        if proposal.requires_approval:
-            if self.approval_gate is None:
-                self._record("approval_unavailable", observation.url, {"reason": "no approval interface is connected"})
-                return True
-            if not self.approval_gate(proposal):
-                self._record("ai_action_rejected", observation.url, {"reason": "human approval was not granted"})
-                return True
-            self._record("ai_action_approved", observation.url, {"action": proposal.action})
-
-        if proposal.action == "stop":
-            self._record("ai_action_executed", observation.url, {"action": "stop"})
-            self.stop()
-            return True
-        if proposal.action == "scroll":
-            page.mouse.wheel(0, 640)
-            self._record("ai_action_executed", observation.url, {"action": "scroll"})
-        elif proposal.action == "screenshot":
-            if self.capture_screenshots:
-                path = self.output_dir / "screenshots" / f"{self.assessment_id}-agent-{len(self._activity):05d}.png"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                page.screenshot(path=str(path), full_page=False, animations="disabled", timeout=self.limits.navigation_timeout_ms)
-            self._record("ai_action_executed", observation.url, {"action": "screenshot", "captured": self.capture_screenshots})
-        elif proposal.action == "inspect":
-            page.evaluate(_PAGE_INSPECTOR)
-            self._record("ai_action_executed", observation.url, {"action": "inspect"})
-        elif proposal.action == "inspect_forms":
-            self._record("ai_action_executed", observation.url, {"action": "inspect_forms", "form_count": len(observation.forms)})
-        elif proposal.action == "inspect_network":
-            self._record("ai_action_executed", observation.url, {"action": "inspect_network", "endpoint_count": len(self._api_endpoints)})
-        elif proposal.action in {"navigate", "click"} and decision.destination:
-            target_id = proposal.target_id or ""
-            if proposal.action == "navigate":
-                queue.append((decision.destination, depth + 1, False))
-                self._record("ai_action_executed", decision.destination, {"action": "navigate"})
-                return True
-            index = anchor_indices.get(target_id)
-            if index is None:
-                self._record("ai_action_rejected", observation.url, {"reason": "link index is unavailable"})
-                return True
-            anchor = page.locator("a[href]").nth(index)
-            href = anchor.get_attribute("href")
-            current_destination = urljoin(page.url, href or "")
+            current_url = page.url or observation.url
             try:
-                self.guardian.validate_url(current_destination)
-            except ScopeViolation:
-                self._record("ai_action_rejected", observation.url, {"reason": "link changed outside authorized scope"})
+                self.guardian.validate_url(current_url)
+            except ScopeViolation as exc:
+                self._record("ai_observation_rejected", current_url, {"reason": str(exc)[:200]})
                 return True
-            if sanitize_url(current_destination) != sanitize_url(decision.destination):
-                self._record("ai_action_rejected", observation.url, {"reason": "link changed after observation"})
+
+            page_data = page.evaluate(_PAGE_INSPECTOR)
+            scroll = page.evaluate(
+                "() => ({y: Math.round(window.scrollY), height: document.documentElement.scrollHeight, "
+                "viewport: window.innerHeight})"
+            )
+            allowed_links: dict[str, str] = {}
+            anchor_indices: dict[str, int] = {}
+            for index, link in enumerate(page_data.get("links", [])[:500]):
+                candidate = str(link.get("url", ""))
+                try:
+                    self.guardian.validate_url(candidate)
+                except ScopeViolation:
+                    continue
+                if (
+                    str(link.get("target", "")).lower() in {"", "_self"}
+                    and not bool(link.get("download"))
+                    and not bool(link.get("has_onclick"))
+                ):
+                    target_id = f"link-{index}"
+                    allowed_links[target_id] = candidate
+                    anchor_indices[target_id] = index
+
+            forms = page_data.get("forms", [])[:100]
+            snapshot = {
+                "current_url": sanitize_url(current_url),
+                "title_present": bool(page_data.get("title")),
+                "interactive_elements": [
+                    {"target_id": key, "kind": "same-scope link", "url": sanitize_url(value)}
+                    for key, value in list(allowed_links.items())[:30]
+                ],
+                "form_summary": {
+                    "count": len(forms),
+                    "methods": sorted({str(form.get("method", "get")) for form in forms}),
+                },
+                "scroll_position": scroll,
+                "recent_actions": [item.event for item in self._activity[-10:]],
+                "authorized_hosts": self.authorization.allowed_domains,
+                "allowed_url_prefixes": self.authorization.allowed_url_prefixes,
+                "request_count": self._request_count,
+                "pages_observed": len(self._pages),
+            }
+            self._record(
+                "ai_observation",
+                current_url,
+                {
+                    "title_present": snapshot["title_present"],
+                    "in_scope_link_count": len(allowed_links),
+                    "form_count": len(forms),
+                    "scroll_y": scroll.get("y", 0),
+                    "scroll_height": scroll.get("height", 0),
+                    "request_count": self._request_count,
+                },
+            )
+            try:
+                proposal = self.ai_planner.propose(snapshot)
+            except ProviderError as exc:
+                self._record("ai_provider_error", current_url, {"reason": str(exc)[:180]})
+                self.ai_planner = None
+                return False
+            except Exception as exc:
+                self._record(
+                    "ai_provider_error",
+                    current_url,
+                    {"reason": f"{type(exc).__name__}: {str(exc)[:140]}", "error_type": type(exc).__name__},
+                )
+                self.ai_planner = None
+                return False
+
+            proposal_id = uuid.uuid4().hex[:12]
+            decision = self._agent_policy.decide(proposal, allowed_links, visited)
+            effective_requires_approval = decision.requires_approval
+            self._record(
+                "ai_proposal",
+                current_url,
+                {
+                    "proposal_id": proposal_id,
+                    "objective": proposal.objective,
+                    "action": proposal.action,
+                    "target_id": proposal.target_id,
+                    "reason": proposal.reason[:240],
+                    "expected_result": proposal.expected_result,
+                    "policy_allowed": decision.allowed,
+                    "policy_reason": decision.reason,
+                    "requires_approval": effective_requires_approval,
+                },
+            )
+            self._record(
+                "ai_policy_decision",
+                current_url,
+                {
+                    "proposal_id": proposal_id,
+                    "action": proposal.action,
+                    "target_id": proposal.target_id,
+                    "allowed": decision.allowed,
+                    "requires_approval": effective_requires_approval,
+                    "reason": decision.reason,
+                    "destination": sanitize_url(decision.destination) if decision.destination else None,
+                },
+            )
+            if not decision.allowed:
+                self._record("ai_action_rejected", current_url, {"proposal_id": proposal_id, "reason": decision.reason})
+                return False
+
+            signature = (
+                proposal.action,
+                proposal.target_id,
+                int(scroll.get("y", 0)) if proposal.action == "scroll" else None,
+            )
+            if signature in repeated_actions:
+                self._record(
+                    "ai_action_rejected",
+                    current_url,
+                    {"proposal_id": proposal_id, "reason": "repeated action made no new observation"},
+                )
                 return True
-            anchor.click(timeout=self.limits.navigation_timeout_ms)
-            current_url = page.url
-            self.guardian.validate_url(current_url)
-            queue.append((current_url, depth + 1, True))
-            self._record("ai_action_executed", current_url, {"action": "click", "target_id": target_id})
-            return True
-        return False
+            repeated_actions.add(signature)
+
+            if proposal.action in {"navigate", "click"} and depth >= self.limits.max_depth:
+                self._record(
+                    "ai_action_rejected",
+                    current_url,
+                    {"proposal_id": proposal_id, "reason": "navigation depth limit reached"},
+                )
+                return True
+
+            if effective_requires_approval:
+                if self.approval_gate is None:
+                    self._record(
+                        "approval_unavailable",
+                        current_url,
+                        {"proposal_id": proposal_id, "reason": "no approval interface is connected"},
+                    )
+                    return True
+                approval_proposal = proposal.model_copy(update={"requires_approval": True})
+                if not self.approval_gate(approval_proposal):
+                    self._record(
+                        "ai_action_rejected",
+                        current_url,
+                        {"proposal_id": proposal_id, "reason": "human approval was not granted"},
+                    )
+                    return True
+                self._record(
+                    "ai_action_approved",
+                    current_url,
+                    {"proposal_id": proposal_id, "action": proposal.action},
+                )
+
+            if proposal.action == "stop":
+                self._record("ai_action_executed", current_url, {"proposal_id": proposal_id, "action": "stop"})
+                self._record("ai_action_verified", current_url, {"proposal_id": proposal_id, "verified": True})
+                self.stop()
+                return True
+
+            if proposal.action == "scroll":
+                before = int(scroll.get("y", 0))
+                page.mouse.wheel(0, 640)
+                after = page.evaluate("() => Math.round(window.scrollY)")
+                verified = int(after) > before
+                self._record(
+                    "ai_action_executed",
+                    current_url,
+                    {"proposal_id": proposal_id, "action": "scroll", "scroll_y": int(after)},
+                )
+                self._record(
+                    "ai_action_verified",
+                    current_url,
+                    {"proposal_id": proposal_id, "action": "scroll", "verified": verified, "scroll_y": int(after)},
+                )
+                if not verified:
+                    return True
+                continue
+
+            if proposal.action == "screenshot":
+                screenshot_name = None
+                captured = False
+                if self.capture_screenshots:
+                    path = self.output_dir / "screenshots" / f"{self.assessment_id}-agent-{proposal_id}.png"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    page.screenshot(
+                        path=str(path),
+                        full_page=False,
+                        animations="disabled",
+                        timeout=self.limits.navigation_timeout_ms,
+                    )
+                    screenshot_name = path.name
+                    captured = path.is_file() and path.stat().st_size > 0
+                self._record(
+                    "ai_action_executed",
+                    current_url,
+                    {"proposal_id": proposal_id, "action": "screenshot", "screenshot": screenshot_name},
+                )
+                self._record(
+                    "ai_action_verified",
+                    current_url,
+                    {"proposal_id": proposal_id, "action": "screenshot", "verified": captured},
+                )
+                continue
+
+            if proposal.action == "inspect":
+                observed = page.evaluate(_PAGE_INSPECTOR)
+                self._record(
+                    "ai_action_executed",
+                    current_url,
+                    {"proposal_id": proposal_id, "action": "inspect"},
+                )
+                self._record(
+                    "ai_action_verified",
+                    current_url,
+                    {
+                        "proposal_id": proposal_id,
+                        "action": "inspect",
+                        "verified": sanitize_url(page.url) == sanitize_url(current_url),
+                        "link_count": len(observed.get("links", [])),
+                        "form_count": len(observed.get("forms", [])),
+                    },
+                )
+                continue
+
+            if proposal.action == "inspect_forms":
+                observed_forms = page.evaluate("() => document.forms.length")
+                self._record(
+                    "ai_action_executed",
+                    current_url,
+                    {"proposal_id": proposal_id, "action": "inspect_forms"},
+                )
+                self._record(
+                    "ai_action_verified",
+                    current_url,
+                    {
+                        "proposal_id": proposal_id,
+                        "action": "inspect_forms",
+                        "verified": int(observed_forms) == len(forms),
+                        "form_count": int(observed_forms),
+                    },
+                )
+                continue
+
+            if proposal.action == "inspect_network":
+                endpoint_count = len(self._api_endpoints)
+                self._record(
+                    "ai_action_executed",
+                    current_url,
+                    {"proposal_id": proposal_id, "action": "inspect_network", "endpoint_count": endpoint_count},
+                )
+                self._record(
+                    "ai_action_verified",
+                    current_url,
+                    {"proposal_id": proposal_id, "action": "inspect_network", "verified": True},
+                )
+                continue
+
+            if proposal.action in {"navigate", "click"} and decision.destination:
+                target_id = proposal.target_id or ""
+                if proposal.action == "navigate":
+                    queue.append((decision.destination, depth + 1, False, proposal_id))
+                    self._record(
+                        "ai_action_queued",
+                        current_url,
+                        {
+                            "proposal_id": proposal_id,
+                            "action": "navigate",
+                            "target_id": target_id,
+                            "destination": sanitize_url(decision.destination),
+                        },
+                    )
+                    return True
+
+                index = anchor_indices.get(target_id)
+                if index is None:
+                    self._record("ai_action_rejected", current_url, {"proposal_id": proposal_id, "reason": "link index is unavailable"})
+                    return True
+                anchor = page.locator("a[href]").nth(index)
+                href = anchor.get_attribute("href")
+                current_destination = urljoin(page.url, href or "")
+                try:
+                    self.guardian.validate_url(current_destination)
+                except ScopeViolation:
+                    self._record("ai_action_rejected", current_url, {"proposal_id": proposal_id, "reason": "link changed outside authorized scope"})
+                    return True
+                if sanitize_url(current_destination) != sanitize_url(decision.destination):
+                    self._record("ai_action_rejected", current_url, {"proposal_id": proposal_id, "reason": "link changed after observation"})
+                    return True
+                target = anchor.get_attribute("target")
+                download = anchor.get_attribute("download")
+                onclick = anchor.get_attribute("onclick")
+                if target not in {None, "", "_self"} or download is not None or onclick is not None:
+                    self._record("ai_action_rejected", current_url, {"proposal_id": proposal_id, "reason": "link behavior changed after observation"})
+                    return True
+                self._record(
+                    "ai_action_started",
+                    current_url,
+                    {"proposal_id": proposal_id, "action": "click", "target_id": target_id},
+                )
+                try:
+                    anchor.click(timeout=self.limits.navigation_timeout_ms)
+                except Exception as exc:
+                    actual_url = page.url or current_url
+                    self._record(
+                        "ai_action_verified",
+                        actual_url,
+                        {
+                            "proposal_id": proposal_id,
+                            "action": "click",
+                            "verified": False,
+                            "expected_url": sanitize_url(decision.destination),
+                            "actual_url": sanitize_url(actual_url),
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                    return True
+                actual_url = page.url
+                self.guardian.validate_url(actual_url)
+                verified = sanitize_url(actual_url) == sanitize_url(decision.destination)
+                self._record(
+                    "ai_action_executed",
+                    actual_url,
+                    {"proposal_id": proposal_id, "action": "click", "target_id": target_id},
+                )
+                self._record(
+                    "ai_action_verified",
+                    actual_url,
+                    {
+                        "proposal_id": proposal_id,
+                        "action": "click",
+                        "verified": verified,
+                        "expected_url": sanitize_url(decision.destination),
+                        "actual_url": sanitize_url(actual_url),
+                    },
+                )
+                if verified:
+                    queue.append((actual_url, depth + 1, True, None))
+                return True
+
+        self._record("agent_stopped", observation.url, {"reason": "agent iteration limit reached"})
+        return True
 
     def _route_request(self, route: Any) -> None:
         request = route.request
