@@ -1,0 +1,10 @@
+{
+  "authorized_by": "Local test operator",
+  "authorization_reference": "Isolated Sentinel fixture on loopback only",
+  "expires_at": "2027-01-01T00:00:00Z",
+  "allowed_domains": ["127.0.0.1"],
+  "include_subdomains": false,
+  "allowed_url_prefixes": [],
+  "allow_private_networks": false,
+  "allow_loopback": true
+}

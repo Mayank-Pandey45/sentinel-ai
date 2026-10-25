@@ -1,0 +1,10 @@
+{
+  "authorized_by": "Replace with your name or client contact",
+  "authorization_reference": "Replace with a written approval or ticket ID",
+  "expires_at": "2027-01-01T00:00:00Z",
+  "allowed_domains": ["example.com"],
+  "include_subdomains": false,
+  "allowed_url_prefixes": [],
+  "allow_private_networks": false,
+  "allow_loopback": false
+}
