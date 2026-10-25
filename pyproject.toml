@@ -9,15 +9,21 @@ description = "Local, scope-bound passive browser security assessment MVP"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "fastapi>=0.115,<1",
   "pydantic>=2.8,<3",
   "playwright>=1.48,<2",
+  "uvicorn[standard]>=0.30,<1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3,<9", "ruff>=0.8,<1"]
+dev = ["httpx>=0.27,<1", "pytest>=8.3,<9", "ruff>=0.8,<1"]
+
+[tool.setuptools.package-data]
+sentinel_ai = ["static/*"]
 
 [project.scripts]
 sentinel-ai = "sentinel_ai.cli:main"
+sentinel-ai-dashboard = "sentinel_ai.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

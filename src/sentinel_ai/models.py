@@ -136,9 +136,10 @@ class PageObservation(BaseModel):
 
 class Finding(BaseModel):
     id: str
+    scan_id: str | None = None
     title: str
     severity: Literal["critical", "high", "medium", "low", "informational"]
-    status: Literal["potential", "verified", "inconclusive"] = "potential"
+    status: Literal["potential", "verified", "inconclusive", "false_positive", "resolved"] = "potential"
     confidence: Literal["low", "medium", "high"]
     category: str
     affected_endpoints: list[str] = Field(default_factory=list)
@@ -148,6 +149,8 @@ class Finding(BaseModel):
     business_impact: str
     recommendation: str
     retest_guidance: str
+    scanner: str = "sentinel-passive"
+    detected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class AssessmentResult(BaseModel):
@@ -160,6 +163,8 @@ class AssessmentResult(BaseModel):
     authorized_domains: list[str] = Field(default_factory=list)
     allowed_url_prefixes: list[str] = Field(default_factory=list)
     browser_metadata: dict[str, str | int | bool | None] = Field(default_factory=dict)
+    selected_checks: list[str] = Field(default_factory=list)
+    worker_id: str = "local"
     pages: list[PageObservation] = Field(default_factory=list)
     api_endpoints: list[str] = Field(default_factory=list)
     findings: list[Finding] = Field(default_factory=list)

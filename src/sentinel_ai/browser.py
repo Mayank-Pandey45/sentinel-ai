@@ -11,9 +11,10 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlsplit
+from typing import Any, Callable
+from urllib.parse import urljoin, urlsplit
 
+from .agent import ActionPolicy, ActionProposal, OpenAICompatiblePlanner, ProviderError
 from .analysis import analyze_pages, discover_form_observations, parse_set_cookie
 from .models import ActivityEvent, AssessmentResult, AuthorizationRecord, PageObservation, ScanLimits
 from .scope import ScopeGuardian, ScopeViolation, sanitize_url
@@ -46,6 +47,11 @@ class BrowserController:
         *,
         headless: bool = False,
         live_logs: bool = True,
+        capture_screenshots: bool = True,
+        selected_checks: list[str] | None = None,
+        ai_planner: OpenAICompatiblePlanner | None = None,
+        approval_gate: Callable[[ActionProposal], bool] | None = None,
+        event_sink: Callable[[ActivityEvent], None] | None = None,
     ) -> None:
         self.authorization = authorization
         self.guardian = ScopeGuardian(authorization)
@@ -54,6 +60,12 @@ class BrowserController:
         self.limits = limits or ScanLimits()
         self.headless = headless
         self.live_logs = live_logs
+        self.capture_screenshots = capture_screenshots
+        self.selected_checks = selected_checks or ["passive_baseline", "browser_discovery"]
+        self.ai_planner = ai_planner
+        self.approval_gate = approval_gate
+        self.event_sink = event_sink
+        self._agent_policy = ActionPolicy(self.guardian, max_iterations=min(20, self.limits.max_pages * 2))
         self.assessment_id = uuid.uuid4().hex[:12]
         self._pages: list[PageObservation] = []
         self._activity: list[ActivityEvent] = []
@@ -99,6 +111,8 @@ class BrowserController:
                 pass
 
     def run(self) -> AssessmentResult:
+        if datetime.now(timezone.utc) >= self.authorization.expires_at:
+            raise ScopeViolation("authorization record expired before the browser run started")
         self.guardian.validate_url(self.target_url)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._activity_path = self.output_dir / "activity.jsonl"
@@ -155,30 +169,52 @@ class BrowserController:
             authorized_domains=self.authorization.allowed_domains,
             allowed_url_prefixes=self.authorization.allowed_url_prefixes,
             browser_metadata=self._browser_metadata,
+            selected_checks=self.selected_checks,
+            worker_id="local",
             pages=self._pages,
             api_endpoints=sorted(self._api_endpoints),
-            findings=analyze_pages(self._pages),
+            findings=self._selected_findings(),
             activity=self._activity.copy(),
             limitations=[
                 "Checks are passive observations and do not provide complete vulnerability coverage.",
-                "Forms are never submitted and the controller does not click page controls.",
+                "Forms are never submitted. The AI planner, when configured, may only activate a discovered in-scope hyperlink; buttons and form controls are never activated.",
                 "The browser request guard is application-level. Use a dedicated VM/container and host or network firewall egress rules for enforcement below the browser and to reduce DNS rebinding risk.",
                 "Requests are paced and total requests are capped, but no independent maximum in-flight request limit is enforced.",
                 "Page JavaScript executes to render the site; non-GET/HEAD requests and common state-changing URL patterns are blocked, but safe assessment should still use an isolated browser environment.",
                 "Authentication flows, authenticated pages, TLS cipher suites, server-side behavior, and dynamic authorization checks are not evaluated.",
                 "Screenshots can contain sensitive page content; keep the local output directory access-controlled.",
+                "A configured AI planner proposes bounded read-only actions; model output is not a security finding and is checked by deterministic policy before execution.",
             ],
         )
 
+    def _selected_findings(self) -> list[Any]:
+        findings = analyze_pages(self._pages)
+        supported = {"passive_headers", "passive_cookie_attributes", "passive_transport", "passive_forms"}
+        selected = set(self.selected_checks)
+        if not selected.intersection(supported):
+            # Preserve the original CLI's passive_baseline behavior for existing callers.
+            if "passive_baseline" in selected:
+                return findings
+            return []
+        def check_for(finding_id: str) -> str:
+            if finding_id.startswith("missing-"):
+                return "passive_headers"
+            if finding_id == "plaintext-http-pages":
+                return "passive_transport"
+            if finding_id == "session-cookie-attributes":
+                return "passive_cookie_attributes"
+            return "passive_forms"
+        return [finding for finding in findings if check_for(finding.id) in selected]
+
     def _crawl(self, page: Any) -> None:
-        queue: deque[tuple[str, int]] = deque([(self.target_url, 0)])
+        queue: deque[tuple[str, int, bool]] = deque([(self.target_url, 0, False)])
         visited: set[str] = set()
         while queue and len(self._pages) < self.limits.max_pages and not self._stop.is_set():
             self._wait_until_resumed()
             self._check_bounds()
             if self._stop.is_set():
                 break
-            url, depth = queue.popleft()
+            url, depth, already_loaded = queue.popleft()
             try:
                 self.guardian.validate_url(url)
             except ScopeViolation as exc:
@@ -193,13 +229,13 @@ class BrowserController:
                 continue
             if self._pages and self.limits.navigation_delay_seconds:
                 time.sleep(self.limits.navigation_delay_seconds)
-            self._record("navigation_started", url, {"depth": depth})
+            self._record("navigation_started", url, {"depth": depth, "via": "approved-link-click" if already_loaded else "navigation"})
             try:
-                response = page.goto(url, wait_until="domcontentloaded")
-                if response is None:
-                    status_code = None
+                if already_loaded and sanitize_url(page.url) == key:
+                    status_code = self._response_details.get(key, {}).get("status_code")
                 else:
-                    status_code = response.status
+                    response = page.goto(url, wait_until="domcontentloaded")
+                    status_code = response.status if response is not None else None
                 if self._stop.is_set():
                     break
                 self._wait_until_resumed()
@@ -210,7 +246,9 @@ class BrowserController:
                 details = self._response_details.get(safe_doc_url, {})
                 safe_links: list[dict[str, str]] = []
                 crawl_candidates: list[str] = []
-                for link in data.get("links", [])[:500]:
+                agent_links: dict[str, str] = {}
+                anchor_indices: dict[str, int] = {}
+                for index, link in enumerate(data.get("links", [])[:500]):
                     candidate = str(link.get("url", ""))
                     try:
                         self.guardian.validate_url(candidate)
@@ -221,6 +259,14 @@ class BrowserController:
                         "text": str(link.get("text", ""))[:160],
                     })
                     crawl_candidates.append(candidate)
+                    target_id = f"link-{index}"
+                    if (
+                        str(link.get("target", "")).lower() in {"", "_self"}
+                        and not bool(link.get("download"))
+                        and not bool(link.get("has_onclick"))
+                    ):
+                        agent_links[target_id] = candidate
+                        anchor_indices[target_id] = index
                 page_observation = PageObservation(
                     url=safe_doc_url,
                     title=str(data.get("title", ""))[:300],
@@ -231,13 +277,32 @@ class BrowserController:
                     links=safe_links,
                     controls=data.get("controls", [])[:200],
                 )
-                shot = self.output_dir / "screenshots" / f"{self.assessment_id}-{len(self._pages) + 1:03d}.png"
-                shot.parent.mkdir(parents=True, exist_ok=True)
-                page.screenshot(path=str(shot), full_page=False, animations="disabled", timeout=self.limits.navigation_timeout_ms)
-                page_observation.screenshot = str(shot.resolve())
+                shot: Path | None = None
+                if self.capture_screenshots:
+                    shot = self.output_dir / "screenshots" / f"{self.assessment_id}-{len(self._pages) + 1:03d}.png"
+                    shot.parent.mkdir(parents=True, exist_ok=True)
+                    page.screenshot(path=str(shot), full_page=False, animations="disabled", timeout=self.limits.navigation_timeout_ms)
+                    page_observation.screenshot = str(shot.resolve())
                 self._pages.append(page_observation)
-                self._record("page_observed", doc_url, {"status_code": status_code, "screenshot": shot.name})
-                if depth < self.limits.max_depth:
+                self._record("page_observed", doc_url, {
+                    "status_code": status_code,
+                    "screenshot": shot.name if shot else None,
+                    "page_count": len(self._pages),
+                    "request_count": self._request_count,
+                })
+                selected_by_agent = False
+                if self.ai_planner:
+                    selected_by_agent = self._run_agent_step(
+                        page,
+                        page_observation,
+                        data,
+                        agent_links,
+                        anchor_indices,
+                        visited,
+                        queue,
+                        depth,
+                    )
+                if depth < self.limits.max_depth and not selected_by_agent:
                     for candidate in crawl_candidates:
                         if not candidate:
                             continue
@@ -246,9 +311,124 @@ class BrowserController:
                         except ScopeViolation:
                             continue
                         if sanitize_url(candidate) not in visited and not self._has_sensitive_action(candidate):
-                            queue.append((candidate, depth + 1))
+                            queue.append((candidate, depth + 1, False))
             except Exception as exc:
                 self._record("navigation_error", url, {"error_type": type(exc).__name__, "message": str(exc)[:300]})
+
+    def _run_agent_step(
+        self,
+        page: Any,
+        observation: PageObservation,
+        page_data: dict[str, Any],
+        allowed_links: dict[str, str],
+        anchor_indices: dict[str, int],
+        visited: set[str],
+        queue: deque[tuple[str, int, bool]],
+        depth: int,
+    ) -> bool:
+        """Ask for one structured action, enforce policy, then execute only supported browser operations."""
+        if self._agent_policy.iterations >= self._agent_policy.max_iterations:
+            self._record("agent_stopped", observation.url, {"reason": "agent iteration limit reached"})
+            return False
+        snapshot = {
+            "current_url": observation.url,
+                    "title_present": bool(observation.title),
+            "interactive_elements": [
+                {"target_id": key, "kind": "same-scope link", "url": sanitize_url(value)}
+                for key, value in list(allowed_links.items())[:30]
+            ],
+            "form_summary": {"count": len(observation.forms), "methods": sorted({str(form.get("method", "get")) for form in observation.forms})},
+            "recent_actions": [item.event for item in self._activity[-10:]],
+            "authorized_hosts": self.authorization.allowed_domains,
+            "allowed_url_prefixes": self.authorization.allowed_url_prefixes,
+            "request_count": self._request_count,
+            "pages_observed": len(self._pages),
+        }
+        try:
+            proposal = self.ai_planner.propose(snapshot)
+        except ProviderError as exc:
+            self._record("ai_provider_error", observation.url, {"reason": str(exc)[:180]})
+            self.ai_planner = None
+            return False
+        except Exception as exc:
+            self._record("ai_provider_error", observation.url, {"reason": f"{type(exc).__name__}: {str(exc)[:140]}"})
+            self.ai_planner = None
+            return False
+
+        decision = self._agent_policy.decide(proposal, allowed_links, visited)
+        self._record("ai_proposal", observation.url, {
+            "objective": proposal.objective,
+            "action": proposal.action,
+            "target_id": proposal.target_id,
+            "reason": proposal.reason[:240],
+            "expected_result": proposal.expected_result,
+            "policy_allowed": decision.allowed,
+            "policy_reason": decision.reason,
+            "requires_approval": proposal.requires_approval,
+        })
+        if not decision.allowed:
+            self._record("ai_action_rejected", observation.url, {"reason": decision.reason})
+            return False
+        if proposal.action in {"navigate", "click"} and depth >= self.limits.max_depth:
+            self._record("ai_action_rejected", observation.url, {"reason": "navigation depth limit reached"})
+            return True
+        if proposal.requires_approval:
+            if self.approval_gate is None:
+                self._record("approval_unavailable", observation.url, {"reason": "no approval interface is connected"})
+                return True
+            if not self.approval_gate(proposal):
+                self._record("ai_action_rejected", observation.url, {"reason": "human approval was not granted"})
+                return True
+            self._record("ai_action_approved", observation.url, {"action": proposal.action})
+
+        if proposal.action == "stop":
+            self._record("ai_action_executed", observation.url, {"action": "stop"})
+            self.stop()
+            return True
+        if proposal.action == "scroll":
+            page.mouse.wheel(0, 640)
+            self._record("ai_action_executed", observation.url, {"action": "scroll"})
+        elif proposal.action == "screenshot":
+            if self.capture_screenshots:
+                path = self.output_dir / "screenshots" / f"{self.assessment_id}-agent-{len(self._activity):05d}.png"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(path), full_page=False, animations="disabled", timeout=self.limits.navigation_timeout_ms)
+            self._record("ai_action_executed", observation.url, {"action": "screenshot", "captured": self.capture_screenshots})
+        elif proposal.action == "inspect":
+            page.evaluate(_PAGE_INSPECTOR)
+            self._record("ai_action_executed", observation.url, {"action": "inspect"})
+        elif proposal.action == "inspect_forms":
+            self._record("ai_action_executed", observation.url, {"action": "inspect_forms", "form_count": len(observation.forms)})
+        elif proposal.action == "inspect_network":
+            self._record("ai_action_executed", observation.url, {"action": "inspect_network", "endpoint_count": len(self._api_endpoints)})
+        elif proposal.action in {"navigate", "click"} and decision.destination:
+            target_id = proposal.target_id or ""
+            if proposal.action == "navigate":
+                queue.append((decision.destination, depth + 1, False))
+                self._record("ai_action_executed", decision.destination, {"action": "navigate"})
+                return True
+            index = anchor_indices.get(target_id)
+            if index is None:
+                self._record("ai_action_rejected", observation.url, {"reason": "link index is unavailable"})
+                return True
+            anchor = page.locator("a[href]").nth(index)
+            href = anchor.get_attribute("href")
+            current_destination = urljoin(page.url, href or "")
+            try:
+                self.guardian.validate_url(current_destination)
+            except ScopeViolation:
+                self._record("ai_action_rejected", observation.url, {"reason": "link changed outside authorized scope"})
+                return True
+            if sanitize_url(current_destination) != sanitize_url(decision.destination):
+                self._record("ai_action_rejected", observation.url, {"reason": "link changed after observation"})
+                return True
+            anchor.click(timeout=self.limits.navigation_timeout_ms)
+            current_url = page.url
+            self.guardian.validate_url(current_url)
+            queue.append((current_url, depth + 1, True))
+            self._record("ai_action_executed", current_url, {"action": "click", "target_id": target_id})
+            return True
+        return False
 
     def _route_request(self, route: Any) -> None:
         request = route.request
@@ -303,6 +483,7 @@ class BrowserController:
         try:
             headers = {key.lower(): value for key, value in response.headers.items()}
             if request.resource_type == "document":
+                details["status_code"] = response.status
                 details["security_headers"] = {
                     key: sanitize_security_header_value(key, headers.get(key)) for key in _SECURITY_HEADERS
                 }
@@ -333,6 +514,11 @@ class BrowserController:
             self._last_request_at = time.monotonic()
 
     def _check_bounds(self) -> None:
+        if datetime.now(timezone.utc) >= self.authorization.expires_at:
+            if not self._stop.is_set():
+                self._stop.set()
+                self._record("authorization_expired", details={"reason": "authorization record expired during the browser run"})
+            return
         elapsed = time.monotonic() - self._started_monotonic
         if not self._stop.is_set() and elapsed > self.limits.max_duration_seconds:
             self._stop.set()
@@ -362,6 +548,12 @@ class BrowserController:
         if self._activity_path:
             with self._activity_path.open("a", encoding="utf-8") as stream:
                 stream.write(item.model_dump_json() + "\n")
+        if self.event_sink:
+            try:
+                self.event_sink(item)
+            except Exception:
+                # Event persistence must not weaken browser cleanup or scope enforcement.
+                pass
         if self.live_logs:
             print(item.model_dump_json(), file=sys.stdout, flush=True)
 
@@ -371,7 +563,10 @@ _PAGE_INSPECTOR = """
   const trim = (value, max = 160) => (value || '').trim().replace(/\\s+/g, ' ').slice(0, max);
   const links = Array.from(document.querySelectorAll('a[href]')).slice(0, 500).map(a => ({
     url: a.href,
-    text: trim(a.innerText || a.getAttribute('aria-label') || a.title)
+    text: trim(a.innerText || a.getAttribute('aria-label') || a.title),
+    target: trim(a.getAttribute('target') || '', 40),
+    download: a.hasAttribute('download'),
+    has_onclick: a.hasAttribute('onclick')
   }));
   const forms = Array.from(document.forms).slice(0, 100).map(form => {
     const fields = Array.from(form.querySelectorAll('input[name], select[name], textarea[name]'));
