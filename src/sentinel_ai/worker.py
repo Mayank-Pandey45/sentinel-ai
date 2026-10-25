@@ -54,8 +54,15 @@ class ScanManager:
 
     def status(self) -> dict[str, Any]:
         worker = self.store.worker("local")
+        browser_channel = os.environ.get("SENTINEL_BROWSER_CHANNEL", "chromium").strip().lower()
         if not worker:
-            return {"connected": False, "worker_id": "local", "mode": "local", "last_heartbeat": None}
+            return {
+                "connected": False,
+                "worker_id": "local",
+                "mode": "local",
+                "browser_channel": browser_channel,
+                "last_heartbeat": None,
+            }
         try:
             heartbeat = datetime.fromisoformat(worker["last_heartbeat"])
             if heartbeat.tzinfo is None:
@@ -63,7 +70,12 @@ class ScanManager:
             age = (datetime.now(timezone.utc) - heartbeat).total_seconds()
         except (TypeError, ValueError):
             age = 999999
-        return {**worker, "connected": worker["status"] == "connected" and age < 10, "heartbeat_age_seconds": round(age, 1)}
+        return {
+            **worker,
+            "connected": worker["status"] == "connected" and age < 10,
+            "heartbeat_age_seconds": round(age, 1),
+            "browser_channel": browser_channel,
+        }
 
     def pause(self, scan_id: str, organization_id: str) -> bool:
         scan = self.store.get_scan(scan_id, organization_id)
@@ -165,6 +177,7 @@ class ScanManager:
                 live_logs=False,
                 capture_screenshots=bool(config.get("capture_screenshots", True)),
                 selected_checks=config.get("selected_checks", []),
+                browser_channel=config.get("browser_channel", os.environ.get("SENTINEL_BROWSER_CHANNEL", "chromium")),
                 ai_planner=planner,
                 approval_gate=lambda proposal: self._approval_gate(scan_id, organization_id, proposal),
                 event_sink=lambda event: self._persist_event(organization_id, scan_id, event),
@@ -184,7 +197,12 @@ class ScanManager:
                 self.store.update_scan(scan_id, status="running")
                 self.store.append_event(organization_id, scan_id, {
                     "event": "job_running", "timestamp": utc_now(), "url": config["target_url"],
-                    "details": {"worker_id": "local", "browser_mode": "headless" if config.get("headless") else "visible"},
+                    "details": {
+                        "worker_id": "local",
+                        "browser_mode": "headless" if config.get("headless") else "visible",
+                        "browser_channel": config.get("browser_channel", os.environ.get("SENTINEL_BROWSER_CHANNEL", "chromium")),
+                        "chromium_sandbox": True,
+                    },
                 })
             result = controller.run()
             serialized = result.model_dump(mode="json")

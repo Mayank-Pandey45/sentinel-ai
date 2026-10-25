@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from sentinel_ai.browser import BrowserController, sanitize_security_header_value
 from sentinel_ai.models import AuthorizationRecord, ScanLimits
@@ -28,6 +29,54 @@ class Route:
         self.aborted = reason
 
 
+class FakeContext:
+    def set_default_navigation_timeout(self, _timeout):
+        pass
+
+    def set_default_timeout(self, _timeout):
+        pass
+
+    def route(self, *_args):
+        pass
+
+    def new_page(self):
+        return FakePage()
+
+    def close(self):
+        pass
+
+
+class FakePage:
+    def on(self, *_args):
+        pass
+
+
+class FakeBrowser:
+    version = "test-chromium"
+
+    def new_context(self, **_kwargs):
+        return FakeContext()
+
+    def close(self):
+        pass
+
+
+class FakePlaywright:
+    def __init__(self):
+        self.launch_options = None
+        self.chromium = self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        pass
+
+    def launch(self, **kwargs):
+        self.launch_options = kwargs
+        return FakeBrowser()
+
+
 def controller(root: Path):
     root.mkdir(parents=True, exist_ok=True)
     authorization = AuthorizationRecord(
@@ -42,6 +91,24 @@ def controller(root: Path):
 
 
 class BrowserPolicyTests(unittest.TestCase):
+    def test_visible_channel_launch_keeps_chromium_sandbox_enabled(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+            instance = controller(Path(tmp))
+            instance.headless = False
+            instance.browser_channel = "chrome-beta"
+            instance._crawl = lambda _page: None
+            fake_playwright = FakePlaywright()
+            with patch("playwright.sync_api.sync_playwright", return_value=fake_playwright):
+                result = instance.run()
+
+            self.assertEqual(
+                fake_playwright.launch_options,
+                {"headless": False, "chromium_sandbox": True, "channel": "chrome-beta"},
+            )
+            self.assertEqual(result.browser_metadata["browser_channel"], "chrome-beta")
+            self.assertFalse(result.browser_metadata["headless"])
+            self.assertTrue(result.browser_metadata["chromium_sandbox"])
+
     def test_security_header_values_redact_nonce_and_query(self):
         value = "script-src 'nonce-verysecretnonce'; report-uri https://example.com/report?token=secret"
         safe = sanitize_security_header_value("content-security-policy", value)
